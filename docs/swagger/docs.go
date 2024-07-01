@@ -159,6 +159,51 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/bookmarks/id/readable": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Get readable version of bookmark.",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api_v1.readableResponseMessage"
+                        }
+                    },
+                    "403": {
+                        "description": "Token not provided/invalid"
+                    }
+                }
+            }
+        },
+        "/api/v1/system/info": {
+            "get": {
+                "description": "Get general system information like Shiori version, database, and OS",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Get general system information",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api_v1.infoResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Only owners can access this endpoint"
+                    }
+                }
+            }
+        },
         "/api/v1/tags": {
             "get": {
                 "produces": [
@@ -206,6 +251,31 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "api_v1.infoResponse": {
+            "type": "object",
+            "properties": {
+                "database": {
+                    "type": "string"
+                },
+                "os": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "object",
+                    "properties": {
+                        "commit": {
+                            "type": "string"
+                        },
+                        "date": {
+                            "type": "string"
+                        },
+                        "tag": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "api_v1.loginRequestPayload": {
             "type": "object",
             "required": [
@@ -236,6 +306,17 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "api_v1.readableResponseMessage": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string"
+                },
+                "html": {
                     "type": "string"
                 }
             }
@@ -308,6 +389,9 @@ const docTemplate = `{
                     "description": "TODO: migrate outside the DTO",
                     "type": "boolean"
                 },
+                "createdAt": {
+                    "type": "string"
+                },
                 "excerpt": {
                     "type": "string"
                 },
@@ -329,7 +413,7 @@ const docTemplate = `{
                 "imageURL": {
                     "type": "string"
                 },
-                "modified": {
+                "modifiedAt": {
                     "type": "string"
                 },
                 "public": {
@@ -384,11 +468,11 @@ const docTemplate = `{
                 "MakePublic": {
                     "type": "boolean"
                 },
-                "NightMode": {
-                    "type": "boolean"
-                },
                 "ShowId": {
                     "type": "boolean"
+                },
+                "Theme": {
+                    "type": "string"
                 },
                 "UseArchive": {
                     "type": "boolean"

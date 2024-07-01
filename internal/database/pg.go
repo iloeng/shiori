@@ -8,13 +8,57 @@ import (
 	"time"
 
 	"github.com/go-shiori/shiori/internal/model"
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/database/postgres"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/bcrypt"
+
+	_ "github.com/lib/pq"
 )
+
+var postgresMigrations = []migration{
+	newFileMigration("0.0.0", "0.1.0", "postgres/0000_system"),
+	newFileMigration("0.1.0", "0.2.0", "postgres/0001_initial"),
+	newFuncMigration("0.2.0", "0.3.0", func(db *sql.DB) error {
+		// Ensure that bookmark table has `has_content` column and account table has `config` column
+		// for users upgrading from <1.5.4 directly into this version.
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to start transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		_, err = tx.Exec(`ALTER TABLE bookmark ADD COLUMN has_content BOOLEAN DEFAULT FALSE NOT NULL`)
+		if err != nil && strings.Contains(err.Error(), `column "has_content" of relation "bookmark" already exists`) {
+			tx.Rollback()
+		} else if err != nil {
+			return fmt.Errorf("failed to add has_content column to bookmark table: %w", err)
+		} else if err == nil {
+			if errCommit := tx.Commit(); errCommit != nil {
+				return fmt.Errorf("failed to commit transaction: %w", errCommit)
+			}
+		}
+
+		tx, err = db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to start transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		_, err = tx.Exec(`ALTER TABLE account ADD COLUMN config JSONB NOT NULL DEFAULT '{}'`)
+		if err != nil && strings.Contains(err.Error(), `column "config" of relation "account" already exists`) {
+			tx.Rollback()
+		} else if err != nil {
+			return fmt.Errorf("failed to add config column to account table: %w", err)
+		} else if err == nil {
+			if errCommit := tx.Commit(); errCommit != nil {
+				return fmt.Errorf("failed to commit transaction: %w", errCommit)
+			}
+		}
+
+		return nil
+	}),
+	newFileMigration("0.3.0", "0.4.0", "postgres/0002_created_time"),
+}
 
 // PGDatabase is implementation of Database interface
 // for connecting to PostgreSQL database.
@@ -33,37 +77,49 @@ func OpenPGDatabase(ctx context.Context, connString string) (pgDB *PGDatabase, e
 	db.SetMaxOpenConns(100)
 	db.SetConnMaxLifetime(time.Second)
 
-	pgDB = &PGDatabase{dbbase: dbbase{*db}}
+	pgDB = &PGDatabase{dbbase: dbbase{db}}
 	return pgDB, err
 }
 
+// DBX returns the underlying sqlx.DB object
+func (db *PGDatabase) DBx() *sqlx.DB {
+	return db.DB
+}
+
 // Migrate runs migrations for this database engine
-func (db *PGDatabase) Migrate() error {
-	sourceDriver, err := iofs.New(migrations, "migrations/postgres")
-	if err != nil {
+func (db *PGDatabase) Migrate(ctx context.Context) error {
+	if err := runMigrations(ctx, db, postgresMigrations); err != nil {
 		return errors.WithStack(err)
-	}
-
-	dbDriver, err := postgres.WithInstance(db.DB.DB, &postgres.Config{})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	migration, err := migrate.NewWithInstance(
-		"iofs",
-		sourceDriver,
-		"postgres",
-		dbDriver,
-	)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	if err := migration.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return err
 	}
 
 	return nil
+}
+
+// GetDatabaseSchemaVersion fetches the current migrations version of the database
+func (db *PGDatabase) GetDatabaseSchemaVersion(ctx context.Context) (string, error) {
+	var version string
+
+	err := db.GetContext(ctx, &version, "SELECT database_schema_version FROM shiori_system")
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+
+	return version, nil
+}
+
+// SetDatabaseSchemaVersion sets the current migrations version of the database
+func (db *PGDatabase) SetDatabaseSchemaVersion(ctx context.Context, version string) error {
+	tx := db.MustBegin()
+	defer tx.Rollback()
+
+	return db.withTx(ctx, func(tx *sqlx.Tx) error {
+		_, err := tx.Exec("UPDATE shiori_system SET database_schema_version = $1", version)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		return tx.Commit()
+	})
 }
 
 // SaveBookmarks saves new or updated bookmarks to database.
@@ -73,8 +129,8 @@ func (db *PGDatabase) SaveBookmarks(ctx context.Context, create bool, bookmarks 
 	if err := db.withTx(ctx, func(tx *sqlx.Tx) error {
 		// Prepare statement
 		stmtInsertBook, err := tx.Preparex(`INSERT INTO bookmark
-			(url, title, excerpt, author, public, content, html, modified)
-			VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+			(url, title, excerpt, author, public, content, html, modified_at, created_at)
+			VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id`)
 		if err != nil {
 			return errors.WithStack(err)
@@ -88,7 +144,7 @@ func (db *PGDatabase) SaveBookmarks(ctx context.Context, create bool, bookmarks 
 			public   = $5,
 			content  = $6,
 			html     = $7,
-			modified = $8
+			modified_at = $8
 			WHERE id = $9`)
 		if err != nil {
 			return errors.WithStack(err)
@@ -132,20 +188,21 @@ func (db *PGDatabase) SaveBookmarks(ctx context.Context, create bool, bookmarks 
 			}
 
 			// Set modified time
-			if book.Modified == "" {
-				book.Modified = modifiedTime
+			if book.ModifiedAt == "" {
+				book.ModifiedAt = modifiedTime
 			}
 
 			// Save bookmark
 			var err error
 			if create {
+				book.CreatedAt = modifiedTime
 				err = stmtInsertBook.QueryRowContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author,
-					book.Public, book.Content, book.HTML, book.Modified).Scan(&book.ID)
+					book.Public, book.Content, book.HTML, book.ModifiedAt, book.CreatedAt).Scan(&book.ID)
 			} else {
 				_, err = stmtUpdateBook.ExecContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author,
-					book.Public, book.Content, book.HTML, book.Modified, book.ID)
+					book.Public, book.Content, book.HTML, book.ModifiedAt, book.ID)
 			}
 			if err != nil {
 				return errors.WithStack(err)
@@ -215,7 +272,8 @@ func (db *PGDatabase) GetBookmarks(ctx context.Context, opts GetBookmarksOptions
 		`excerpt`,
 		`author`,
 		`public`,
-		`modified`,
+		`created_at`,
+		`modified_at`,
 		`content <> '' has_content`}
 
 	if opts.WithContent {
@@ -304,7 +362,7 @@ func (db *PGDatabase) GetBookmarks(ctx context.Context, opts GetBookmarksOptions
 	case ByLastAdded:
 		query += ` ORDER BY id DESC`
 	case ByLastModified:
-		query += ` ORDER BY modified DESC`
+		query += ` ORDER BY modified_at DESC`
 	default:
 		query += ` ORDER BY id`
 	}
@@ -515,7 +573,7 @@ func (db *PGDatabase) GetBookmark(ctx context.Context, id int, url string) (mode
 	args := []interface{}{id}
 	query := `SELECT
 		id, url, title, excerpt, author, public,
-		content, html, modified, content <> '' has_content
+		content, html, modified_at, created_at, content <> '' has_content
 		FROM bookmark WHERE id = $1`
 
 	if url != "" {
